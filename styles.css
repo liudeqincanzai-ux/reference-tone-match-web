@@ -74,7 +74,7 @@ button:disabled {
   z-index: 20;
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) 130px minmax(140px, 0.42fr) minmax(140px, 0.42fr) minmax(330px, 0.8fr);
+  grid-template-columns: minmax(220px, 1fr) 130px minmax(390px, 0.95fr) minmax(330px, 0.8fr);
   gap: 10px;
   align-items: center;
   padding: 8px 18px;
@@ -103,6 +103,22 @@ button:disabled {
   gap: 4px;
 }
 
+.toolbar-output {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.output-selects {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.toolbar-output .slider-label.compact {
+  margin-top: 0;
+}
+
 .toolbar-actions {
   display: grid;
   grid-template-columns: 1.12fr 1fr;
@@ -129,11 +145,11 @@ button:disabled {
   grid-column: 2;
   grid-row: 2;
   position: sticky;
-  top: 100px;
+  top: 118px;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  height: calc(100vh - 100px);
+  height: calc(100vh - 118px);
   overflow: auto;
   padding: 12px;
   border-left: 1px solid var(--line);
@@ -387,6 +403,88 @@ input[type="range"] {
   accent-color: var(--accent);
 }
 
+.lut-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.lut-library-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.lut-library-summary strong {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.lut-layer {
+  display: grid;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.lut-layer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.lut-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.lut-actions .secondary-pick,
+.lut-actions .ghost-button {
+  width: auto;
+  min-height: 30px;
+  padding-inline: 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.lut-select-row {
+  display: grid;
+  gap: 4px;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.lut-select {
+  min-height: 36px;
+  font-size: 13px;
+}
+
+.lut-file-name {
+  min-height: 18px;
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lut-amount {
+  margin: 0;
+}
+
 .status-panel {
   display: grid;
   gap: 10px;
@@ -450,7 +548,7 @@ input[type="range"] {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  min-height: calc(100vh - 100px);
+  min-height: calc(100vh - 118px);
   overflow: auto;
   padding: 10px 12px 14px;
 }
@@ -466,7 +564,7 @@ input[type="range"] {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
-  height: calc(100vh - 210px);
+  height: calc(100vh - 228px);
   min-height: 560px;
 }
 
@@ -538,6 +636,7 @@ input[type="range"] {
   min-height: 0;
   overflow: hidden;
   background: var(--media-bg);
+  touch-action: none;
 }
 
 .preview-frame img,
@@ -550,6 +649,8 @@ input[type="range"] {
   min-height: 0;
   object-fit: contain;
   background: var(--media-bg);
+  transform-origin: 50% 50%;
+  will-change: transform;
 }
 
 .preview-frame canvas {
@@ -558,11 +659,17 @@ input[type="range"] {
 
 .compare-stage {
   --compare-position: 50%;
+  --compare-local-position: 50%;
   cursor: ew-resize;
 }
 
 .compare-after {
-  clip-path: inset(0 calc(100% - var(--compare-position)) 0 0);
+  clip-path: inset(0 calc(100% - var(--compare-local-position)) 0 0);
+}
+
+.preview-media.is-panning,
+.compare-stage.is-panning {
+  cursor: grabbing;
 }
 
 .compare-handle {
@@ -987,6 +1094,10 @@ input[type="range"] {
     grid-template-columns: 1fr;
   }
 
+  .output-selects {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .theme-toggle,
   .toolbar-actions .process-button {
     min-height: 44px;
@@ -1064,6 +1175,10 @@ input[type="range"] {
 }
 
 @media (max-width: 560px) {
+  .output-selects {
+    grid-template-columns: 1fr;
+  }
+
   .card-actions {
     grid-auto-flow: row;
     grid-template-columns: 1fr;

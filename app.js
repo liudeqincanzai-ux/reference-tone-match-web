@@ -22,6 +22,15 @@ const dom = {
   qualityRange: document.getElementById("qualityRange"),
   qualityValue: document.getElementById("qualityValue"),
   themeToggle: document.getElementById("themeToggle"),
+  lutInputs: [document.getElementById("lut1Input"), document.getElementById("lut2Input")],
+  lutSelects: [document.getElementById("lut1Select"), document.getElementById("lut2Select")],
+  pickLutBtns: [document.getElementById("pickLut1Btn"), document.getElementById("pickLut2Btn")],
+  clearLutBtns: [document.getElementById("clearLut1Btn"), document.getElementById("clearLut2Btn")],
+  deleteLutBtns: [document.getElementById("deleteLut1Btn"), document.getElementById("deleteLut2Btn")],
+  lutNames: [document.getElementById("lut1Name"), document.getElementById("lut2Name")],
+  lutAmountRanges: [document.getElementById("lut1AmountRange"), document.getElementById("lut2AmountRange")],
+  lutAmountValues: [document.getElementById("lut1AmountValue"), document.getElementById("lut2AmountValue")],
+  lutLibraryCount: document.getElementById("lutLibraryCount"),
   statusLine: document.getElementById("statusLine"),
   progressBar: document.getElementById("progressBar"),
   processBtn: document.getElementById("processBtn"),
@@ -74,6 +83,22 @@ const state = {
     refs: [],
     targets: [],
   },
+  userLuts: [
+    { id: "", name: "", lut: null },
+    { id: "", name: "", lut: null },
+  ],
+  lutLibrary: [],
+  previewView: {
+    scale: 1,
+    x: 0,
+    y: 0,
+    dragging: false,
+    pointerId: null,
+    startX: 0,
+    startY: 0,
+    originX: 0,
+    originY: 0,
+  },
   busy: false,
 };
 
@@ -82,6 +107,11 @@ const MAX_REFERENCE_EDGE = 1800;
 const CHUNK_PIXELS = 70000;
 const MAX_LIVE_PREVIEW_EDGE = 1600;
 const LUT_GRID_SIZE = 17;
+const USER_LUT_LIMIT = 50;
+const LUT_DB_NAME = "reference-tone-match-luts";
+const LUT_DB_VERSION = 1;
+const LUT_STORE_NAME = "luts";
+const LUT_ACTIVE_STORAGE_KEY = "reference-tone-match-active-luts";
 const RAW_EXTENSIONS = new Set(["arw", "orf", "rw2", "raf", "cr2", "cr3", "nef", "dng", "srw", "pef", "3fr", "rwl"]);
 const DECODE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp", "avif", "gif", "bmp", "heic", "heif"]);
 const HSL_CHANNELS = ["red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"];
@@ -189,6 +219,7 @@ function defaultParams() {
       saturation: 0,
     },
     hsl: defaultHsl(),
+    userLutAmounts: [100, 100],
   };
 }
 
@@ -1228,6 +1259,267 @@ function sampleStyleLut(lut, r, g, b) {
   return out;
 }
 
+function parseCubeLut(text, name = "LUT") {
+  const lines = text.split(/\r?\n/);
+  let size = 0;
+  let title = "";
+  let domainMin = [0, 0, 0];
+  let domainMax = [1, 1, 1];
+  const values = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/#.*/, "").trim();
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    const keyword = parts[0].toUpperCase();
+    if (keyword === "TITLE") {
+      title = line.slice(parts[0].length).trim().replace(/^"|"$/g, "");
+      continue;
+    }
+    if (keyword === "LUT_3D_SIZE") {
+      size = Number(parts[1]);
+      values.length = 0;
+      continue;
+    }
+    if (keyword === "DOMAIN_MIN" && parts.length >= 4) {
+      domainMin = parts.slice(1, 4).map(Number);
+      continue;
+    }
+    if (keyword === "DOMAIN_MAX" && parts.length >= 4) {
+      domainMax = parts.slice(1, 4).map(Number);
+      continue;
+    }
+    if (keyword.startsWith("LUT_1D") || keyword === "DOMAIN_MIN" || keyword === "DOMAIN_MAX") continue;
+    if (parts.length < 3) continue;
+    if (!size) continue;
+    const rgb = parts.slice(0, 3).map(Number);
+    if (rgb.every(Number.isFinite)) values.push(rgb.map(clamp01));
+  }
+
+  if (!Number.isInteger(size) || size < 2 || size > 65) {
+    throw new Error("只支持标准 .cube 3D LUT，请检查文件里的 LUT_3D_SIZE。");
+  }
+  const expected = size * size * size;
+  if (values.length < expected) {
+    throw new Error(`LUT 数据不完整：需要 ${expected} 行颜色数据，当前只有 ${values.length} 行。`);
+  }
+
+  const data = new Float32Array(expected * 3);
+  for (let i = 0; i < expected; i += 1) {
+    data[i * 3] = values[i][0];
+    data[i * 3 + 1] = values[i][1];
+    data[i * 3 + 2] = values[i][2];
+  }
+  return { name: title || name, size, data, domainMin, domainMax };
+}
+
+function sampleCubeLut(lut, r, g, b) {
+  const size = lut.size;
+  const max = size - 1;
+  const normalize = (value, ch) => {
+    const min = lut.domainMin?.[ch] ?? 0;
+    const maxValue = lut.domainMax?.[ch] ?? 1;
+    return clamp((value - min) / Math.max(0.000001, maxValue - min), 0, 1);
+  };
+  const fr = normalize(r, 0) * max;
+  const fg = normalize(g, 1) * max;
+  const fb = normalize(b, 2) * max;
+  const r0 = Math.floor(fr);
+  const g0 = Math.floor(fg);
+  const b0 = Math.floor(fb);
+  const r1 = Math.min(max, r0 + 1);
+  const g1 = Math.min(max, g0 + 1);
+  const b1 = Math.min(max, b0 + 1);
+  const tr = fr - r0;
+  const tg = fg - g0;
+  const tb = fb - b0;
+
+  const read = (ri, gi, bi, ch) => lut.data[((bi * size + gi) * size + ri) * 3 + ch];
+  const out = [0, 0, 0];
+  for (let ch = 0; ch < 3; ch += 1) {
+    const c000 = read(r0, g0, b0, ch);
+    const c100 = read(r1, g0, b0, ch);
+    const c010 = read(r0, g1, b0, ch);
+    const c110 = read(r1, g1, b0, ch);
+    const c001 = read(r0, g0, b1, ch);
+    const c101 = read(r1, g0, b1, ch);
+    const c011 = read(r0, g1, b1, ch);
+    const c111 = read(r1, g1, b1, ch);
+    const c00 = mix(c000, c100, tr);
+    const c10 = mix(c010, c110, tr);
+    const c01 = mix(c001, c101, tr);
+    const c11 = mix(c011, c111, tr);
+    out[ch] = mix(mix(c00, c10, tg), mix(c01, c11, tg), tb);
+  }
+  return out;
+}
+
+function applyUserLutsToSrgb(r, g, b, settings) {
+  const amounts = settings.userLutAmounts || [100, 100];
+  let sr = clamp01(r);
+  let sg = clamp01(g);
+  let sb = clamp01(b);
+  for (let layer = 0; layer < state.userLuts.length; layer += 1) {
+    const lut = state.userLuts[layer]?.lut;
+    const amount = clamp((amounts[layer] ?? 100) / 100, 0, 1);
+    if (!lut || amount <= 0) continue;
+    const mapped = sampleCubeLut(lut, sr, sg, sb);
+    sr = mix(sr, mapped[0], amount);
+    sg = mix(sg, mapped[1], amount);
+    sb = mix(sb, mapped[2], amount);
+  }
+  return [clamp01(sr), clamp01(sg), clamp01(sb)];
+}
+
+function openLutDb() {
+  if (!window.indexedDB) return Promise.reject(new Error("当前浏览器不支持本地 LUT 库。"));
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(LUT_DB_NAME, LUT_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(LUT_STORE_NAME)) {
+        const store = db.createObjectStore(LUT_STORE_NAME, { keyPath: "id" });
+        store.createIndex("createdAt", "createdAt");
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("无法打开本地 LUT 库。"));
+  });
+}
+
+function runLutStore(mode, callback) {
+  return openLutDb().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(LUT_STORE_NAME, mode);
+    const store = tx.objectStore(LUT_STORE_NAME);
+    const result = callback(store);
+    tx.oncomplete = () => {
+      db.close();
+      resolve(result);
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error || new Error("LUT 库操作失败。"));
+    };
+  }));
+}
+
+function getAllStoredLuts() {
+  return openLutDb().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(LUT_STORE_NAME, "readonly");
+    const request = tx.objectStore(LUT_STORE_NAME).getAll();
+    request.onsuccess = () => {
+      db.close();
+      resolve(request.result || []);
+    };
+    request.onerror = () => {
+      db.close();
+      reject(request.error || new Error("无法读取本地 LUT 库。"));
+    };
+  }));
+}
+
+function storedActiveLutIds() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LUT_ACTIVE_STORAGE_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed.slice(0, 2).map((id) => String(id || "")) : ["", ""];
+  } catch {
+    return ["", ""];
+  }
+}
+
+function persistActiveLutIds() {
+  try {
+    localStorage.setItem(LUT_ACTIVE_STORAGE_KEY, JSON.stringify(state.userLuts.map((item) => item.id || "")));
+  } catch {
+    // Ignore private browsing storage failures.
+  }
+}
+
+function renderLutLibrary() {
+  const sorted = state.lutLibrary.slice().sort((a, b) => b.createdAt - a.createdAt);
+  if (dom.lutLibraryCount) dom.lutLibraryCount.textContent = `${sorted.length}/${USER_LUT_LIMIT}`;
+  for (let layer = 0; layer < dom.lutSelects.length; layer += 1) {
+    const select = dom.lutSelects[layer];
+    if (!select) continue;
+    const activeId = state.userLuts[layer]?.id || "";
+    select.innerHTML = '<option value="">不使用 LUT</option>';
+    for (const entry of sorted) {
+      const option = document.createElement("option");
+      option.value = entry.id;
+      option.textContent = entry.name;
+      select.appendChild(option);
+    }
+    select.value = sorted.some((entry) => entry.id === activeId) ? activeId : "";
+  }
+  updateLutLabels();
+}
+
+async function loadLutLibrary() {
+  try {
+    const entries = await getAllStoredLuts();
+    state.lutLibrary = entries.sort((a, b) => b.createdAt - a.createdAt);
+    renderLutLibrary();
+  } catch (error) {
+    console.error(error);
+    setStatus(`LUT 库读取失败：${error.message}`, 0);
+  }
+}
+
+async function selectUserLut(layer, id, options = {}) {
+  const entry = state.lutLibrary.find((item) => item.id === id);
+  if (!entry) {
+    state.userLuts[layer] = { id: "", name: "", lut: null };
+  } else {
+    if (!entry.parsed) entry.parsed = parseCubeLut(entry.text, entry.name);
+    state.userLuts[layer] = { id: entry.id, name: entry.name, lut: entry.parsed };
+  }
+  persistActiveLutIds();
+  renderLutLibrary();
+  saveCurrentParams();
+  if (options.refresh !== false) scheduleSmartPreviewUpdate();
+}
+
+async function restoreActiveLuts() {
+  const ids = storedActiveLutIds();
+  for (let layer = 0; layer < dom.lutSelects.length; layer += 1) {
+    if (ids[layer]) await selectUserLut(layer, ids[layer], { refresh: false });
+  }
+}
+
+async function saveLutEntry(file, text, parsed) {
+  if (state.lutLibrary.length >= USER_LUT_LIMIT) {
+    throw new Error(`LUT 库最多保存 ${USER_LUT_LIMIT} 个，请先删除不需要的 LUT。`);
+  }
+  const now = Date.now();
+  const stored = {
+    id: `${now}-${Math.random().toString(36).slice(2, 9)}`,
+    name: file.name,
+    title: parsed.name || file.name,
+    size: parsed.size,
+    text,
+    createdAt: now,
+  };
+  await runLutStore("readwrite", (store) => store.put(stored));
+  const entry = { ...stored, parsed };
+  state.lutLibrary.unshift(entry);
+  renderLutLibrary();
+  return entry;
+}
+
+async function deleteLutEntry(id) {
+  if (!id) return;
+  await runLutStore("readwrite", (store) => store.delete(id));
+  state.lutLibrary = state.lutLibrary.filter((entry) => entry.id !== id);
+  for (let layer = 0; layer < state.userLuts.length; layer += 1) {
+    if (state.userLuts[layer].id === id) {
+      state.userLuts[layer] = { id: "", name: "", lut: null };
+    }
+  }
+  persistActiveLutIds();
+  renderLutLibrary();
+  scheduleSmartPreviewUpdate();
+}
+
 function applyHslAdjustments(r, g, b, hslAdjustments) {
   if (!hslAdjustments) return [r, g, b];
   const hsv = rgbToHsv(r, g, b);
@@ -1384,6 +1676,16 @@ function updateHslLabels() {
   }
 }
 
+function updateLutLabels() {
+  for (let layer = 0; layer < dom.lutAmountRanges.length; layer += 1) {
+    const input = dom.lutAmountRanges[layer];
+    const valueEl = dom.lutAmountValues[layer];
+    const nameEl = dom.lutNames[layer];
+    if (input && valueEl) valueEl.textContent = `${input.value}%`;
+    if (nameEl) nameEl.textContent = state.userLuts[layer]?.name || "未启用";
+  }
+}
+
 function resetControlToZero(input) {
   input.value = "0";
   if (input.classList.contains("hsl-slider")) updateHslLabels();
@@ -1409,6 +1711,7 @@ function readParamsFromControls() {
     const axis = input.dataset.axis;
     params.hsl[channel][axis] = Number(input.value);
   }
+  params.userLutAmounts = dom.lutAmountRanges.map((input) => Number(input?.value ?? 100));
   return params;
 }
 
@@ -1432,8 +1735,12 @@ function applyParamsToControls(params) {
     const axis = input.dataset.axis;
     input.value = next.hsl?.[channel]?.[axis] || 0;
   }
+  for (let layer = 0; layer < dom.lutAmountRanges.length; layer += 1) {
+    if (dom.lutAmountRanges[layer]) dom.lutAmountRanges[layer].value = next.userLutAmounts?.[layer] ?? 100;
+  }
   updateAdjustmentLabels();
   updateHslLabels();
+  updateLutLabels();
 }
 
 function saveCurrentParams() {
@@ -1452,9 +1759,10 @@ function summarizeFiles(files) {
 }
 
 function summarizeOutputs(outputs) {
-  if (!outputs.length) return "未选择";
-  const names = outputs.slice(0, 7).map((output) => output.name).join("、");
-  return outputs.length > 7 ? `${names} ... 共 ${outputs.length} 张` : `${names}，共 ${outputs.length} 张`;
+  const available = outputs.filter(Boolean);
+  if (!available.length) return "未选择";
+  const names = available.slice(0, 7).map((output) => output.name).join("、");
+  return available.length > 7 ? `${names} ... 共 ${available.length} 张` : `${names}，共 ${available.length} 张`;
 }
 
 function updateResultList() {
@@ -1505,9 +1813,103 @@ function clearCanvas(canvas) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
+function compareLocalPosition() {
+  const rect = dom.compareStage.getBoundingClientRect();
+  if (rect.width <= 0) return state.comparePosition;
+  const local = 50 + (state.comparePosition - 50) / state.previewView.scale - (state.previewView.x / (rect.width * state.previewView.scale)) * 100;
+  return clamp(local, 0, 100);
+}
+
+function applyPreviewViewTransform() {
+  const { scale, x, y } = state.previewView;
+  const transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  for (const el of [dom.targetPreview, dom.beforeCanvas, dom.resultCanvas]) {
+    if (!el) continue;
+    el.style.transform = transform;
+  }
+  dom.compareStage.style.setProperty("--preview-scale", String(scale));
+  dom.compareStage.style.setProperty("--preview-pan-x", `${x}px`);
+  dom.compareStage.style.setProperty("--preview-pan-y", `${y}px`);
+  dom.compareStage.style.setProperty("--compare-local-position", `${compareLocalPosition()}%`);
+}
+
+function resetPreviewView() {
+  state.previewView.scale = 1;
+  state.previewView.x = 0;
+  state.previewView.y = 0;
+  applyPreviewViewTransform();
+}
+
+function isPreviewViewGesture(event) {
+  return event.ctrlKey || event.metaKey;
+}
+
+function zoomPreviewView(deltaY, clientX, clientY, targetEl) {
+  const rect = targetEl.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+  const oldScale = state.previewView.scale;
+  const zoomFactor = Math.exp(-deltaY * 0.0015);
+  const nextScale = clamp(oldScale * zoomFactor, 1, 8);
+  const rx = clientX - rect.left - rect.width / 2;
+  const ry = clientY - rect.top - rect.height / 2;
+  if (Math.abs(nextScale - 1) < 0.0001) {
+    state.previewView.scale = 1;
+    state.previewView.x = 0;
+    state.previewView.y = 0;
+  } else {
+    const ratio = nextScale / oldScale;
+    state.previewView.scale = nextScale;
+    state.previewView.x = rx - (rx - state.previewView.x) * ratio;
+    state.previewView.y = ry - (ry - state.previewView.y) * ratio;
+  }
+  applyPreviewViewTransform();
+}
+
+function beginPreviewPan(event) {
+  if (!isPreviewViewGesture(event) || event.button !== 0 || state.previewView.scale <= 1) return false;
+  state.previewView.dragging = true;
+  state.previewView.pointerId = event.pointerId;
+  state.previewView.startX = event.clientX;
+  state.previewView.startY = event.clientY;
+  state.previewView.originX = state.previewView.x;
+  state.previewView.originY = state.previewView.y;
+  try {
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  } catch {
+    // Synthetic pointer events used by tests may not have an active pointer.
+  }
+  event.currentTarget.classList.add("is-panning");
+  event.preventDefault();
+  return true;
+}
+
+function movePreviewPan(event) {
+  if (!state.previewView.dragging || event.pointerId !== state.previewView.pointerId) return false;
+  state.previewView.x = state.previewView.originX + event.clientX - state.previewView.startX;
+  state.previewView.y = state.previewView.originY + event.clientY - state.previewView.startY;
+  applyPreviewViewTransform();
+  event.preventDefault();
+  return true;
+}
+
+function endPreviewPan(event) {
+  if (!state.previewView.dragging || event.pointerId !== state.previewView.pointerId) return;
+  state.previewView.dragging = false;
+  state.previewView.pointerId = null;
+  event.currentTarget.classList.remove("is-panning");
+  try {
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+    }
+  } catch {
+    // Ignore pointer capture cleanup failures from synthetic events.
+  }
+}
+
 function setComparePosition(value) {
   state.comparePosition = clamp(value, 0, 100);
   dom.compareStage.style.setProperty("--compare-position", `${state.comparePosition}%`);
+  dom.compareStage.style.setProperty("--compare-local-position", `${compareLocalPosition()}%`);
   dom.compareHandle.setAttribute("aria-valuenow", String(Math.round(state.comparePosition)));
 }
 
@@ -1552,6 +1954,7 @@ function renderFileThumbs(files, stripEl, kind, activeIndex, onSelect) {
 function renderOutputThumbs() {
   dom.resultThumbs.innerHTML = "";
   state.outputs.forEach((output, index) => {
+    if (!output) return;
     const button = document.createElement("button");
     button.type = "button";
     button.className = "thumb-button";
@@ -1584,6 +1987,7 @@ function selectTarget(index, syncOutput = true) {
   updateActiveThumbs(dom.targetThumbs, state.activeTargetIndex);
   applyParamsToControls(state.targetParams[state.activeTargetIndex] || defaultParams());
   if (syncOutput && state.outputs[state.activeTargetIndex]) selectOutput(state.activeTargetIndex, false);
+  else if (syncOutput) scheduleBasePreviewUpdate();
 }
 
 function refreshFileLists() {
@@ -1602,7 +2006,9 @@ function clearOutputs() {
   clearTimeout(state.liveTimer);
   clearTimeout(state.previewTimer);
   state.previewRevision += 1;
-  for (const output of state.outputs) URL.revokeObjectURL(output.url);
+  for (const output of state.outputs) {
+    if (output?.url) URL.revokeObjectURL(output.url);
+  }
   state.outputs = [];
   state.activeOutput = null;
   state.activeOutputIndex = -1;
@@ -1699,6 +2105,7 @@ function selectOutput(index, syncTarget = true) {
   dom.resultCanvas.height = output.canvas.height;
   resultCtx.drawImage(output.canvas, 0, 0);
   dom.resultCanvas.closest(".preview-frame").classList.add("has-media");
+  applyPreviewViewTransform();
   setComparePosition(state.comparePosition);
   dom.downloadBtn.disabled = false;
   updateActiveThumbs(dom.resultThumbs, index);
@@ -1712,14 +2119,14 @@ function addOutput(output) {
   dom.downloadAllBtn.disabled = false;
 }
 
-function replaceOutput(index, output) {
+function replaceOutput(index, output, select = true) {
   const oldOutput = state.outputs[index];
   if (oldOutput?.url) URL.revokeObjectURL(oldOutput.url);
   state.outputs[index] = output;
   renderOutputThumbs();
-  selectOutput(index, false);
+  if (select) selectOutput(index, false);
   updateResultList();
-  dom.downloadAllBtn.disabled = state.outputs.length === 0;
+  dom.downloadAllBtn.disabled = !state.outputs.some(Boolean);
 }
 
 async function renderManualAdjustmentsToCanvas(baseImageData, settings, targetCanvas = null, statusText = null, progressStart = null, progressEnd = null) {
@@ -1740,9 +2147,10 @@ async function renderManualAdjustmentsToCanvas(baseImageData, settings, targetCa
       baseImageData.data[i + 2] / 255,
       settings
     );
-    out.data[i] = Math.round(adjusted[0] * 255);
-    out.data[i + 1] = Math.round(adjusted[1] * 255);
-    out.data[i + 2] = Math.round(adjusted[2] * 255);
+    const withLut = applyUserLutsToSrgb(adjusted[0], adjusted[1], adjusted[2], settings);
+    out.data[i] = Math.round(withLut[0] * 255);
+    out.data[i + 1] = Math.round(withLut[1] * 255);
+    out.data[i + 2] = Math.round(withLut[2] * 255);
     if (p % CHUNK_PIXELS === 0) {
       if (statusText && progressStart !== null && progressEnd !== null) {
         const t = p / pixelCount;
@@ -1753,6 +2161,46 @@ async function renderManualAdjustmentsToCanvas(baseImageData, settings, targetCa
   }
   ctx.putImageData(out, 0, 0);
   return canvas;
+}
+
+async function processBaseTarget(file, index, total, imageParams, options = {}) {
+  const settings = imageParams || readParamsFromControls();
+  const maxEdge = options.maxEdge ?? Number(dom.sizeSelect.value);
+  const previewOnly = Boolean(options.previewOnly);
+  const progressBase = options.progressBase ?? 18;
+  const progressSpan = options.progressSpan ?? 68;
+  const label = options.label || "正在生成结果预览";
+
+  setStatus(`${label} ${index + 1}/${total}：${file.name}`, progressBase + (index / Math.max(1, total)) * progressSpan);
+  const loaded = await loadImageToImageData(file, maxEdge);
+  const previewBaseCanvas = scaleCanvasToMaxEdge(loaded.canvas, MAX_LIVE_PREVIEW_EDGE);
+  const previewBaseImageData = canvasToImageData(previewBaseCanvas);
+  const previewCanvas = await renderManualAdjustmentsToCanvas(
+    previewBaseImageData,
+    settings,
+    null,
+    `${label} ${index + 1}/${total}：${file.name}`,
+    progressBase + (index / Math.max(1, total)) * progressSpan,
+    progressBase + ((index + 0.88) / Math.max(1, total)) * progressSpan
+  );
+  const sourcePreviewCanvas = scaleCanvasToSize(loaded.canvas, previewCanvas.width, previewCanvas.height);
+  const thumbBlob = await canvasToBlob(previewCanvas, "image/jpeg", 0.86);
+  const url = URL.createObjectURL(thumbBlob);
+  return {
+    canvas: previewCanvas,
+    baseCanvas: loaded.canvas,
+    previewBaseImageData,
+    sourceCanvas: loaded.canvas,
+    sourcePreviewCanvas,
+    blob: thumbBlob,
+    url,
+    name: outputName(file.name, dom.formatSelect.value),
+    params: deepClone(settings),
+    coreParams: null,
+    maxEdge,
+    previewOnly,
+    toneMatched: false,
+  };
 }
 
 async function analyzeReferences(files) {
@@ -1831,15 +2279,13 @@ async function processTarget(file, refStats, index, total, imageParams) {
     params: deepClone(settings),
     coreParams: coreParamsFromSettings(settings),
     maxEdge,
+    previewOnly: false,
+    toneMatched: true,
   };
 }
 
 async function processAll() {
   if (state.busy || state.liveBusy) return;
-  if (!state.references.length) {
-    setStatus("请先选择参考图。", 0);
-    return;
-  }
   if (!state.targets.length) {
     setStatus("请先选择素材图。", 0);
     return;
@@ -1857,12 +2303,25 @@ async function processAll() {
   ensureTargetParams();
   setBusy(true);
   try {
-    state.refStats = await analyzeReferences(state.references);
-    for (let i = 0; i < state.targets.length; i += 1) {
-      const output = await processTarget(state.targets[i], state.refStats, i, state.targets.length, state.targetParams[i] || readParamsFromControls());
-      addOutput(output);
+    if (state.references.length) {
+      state.refStats = await analyzeReferences(state.references);
+      for (let i = 0; i < state.targets.length; i += 1) {
+        const output = await processTarget(state.targets[i], state.refStats, i, state.targets.length, state.targetParams[i] || readParamsFromControls());
+        addOutput(output);
+      }
+      setStatus(`处理完成：${state.targets.length} 张。`, 100);
+    } else {
+      state.refStats = null;
+      for (let i = 0; i < state.targets.length; i += 1) {
+        const output = await processBaseTarget(state.targets[i], i, state.targets.length, state.targetParams[i] || readParamsFromControls(), {
+          maxEdge: Number(dom.sizeSelect.value),
+          previewOnly: false,
+          label: "正在套用 LUT / 参数",
+        });
+        addOutput(output);
+      }
+      setStatus(`已生成 LUT / 参数结果：${state.targets.length} 张。`, 100);
     }
-    setStatus(`处理完成：${state.targets.length} 张。`, 100);
   } catch (error) {
     console.error(error);
     setStatus(`处理失败：${error.message}`, 0);
@@ -1872,10 +2331,11 @@ async function processAll() {
 }
 
 function canLiveUpdate() {
+  const output = state.outputs[state.activeTargetIndex];
   return Boolean(
     state.refStats &&
       state.targets[state.activeTargetIndex] &&
-      state.outputs[state.activeTargetIndex] &&
+      output?.toneMatched &&
       !state.busy
   );
 }
@@ -1926,9 +2386,27 @@ function canFastPreviewUpdate() {
   return Boolean(output?.previewBaseImageData && !state.busy && !state.liveBusy);
 }
 
+function canBasePreviewUpdate() {
+  const file = state.targets[state.activeTargetIndex];
+  return Boolean(file && canBrowserDecode(file) && !state.busy && !state.liveBusy);
+}
+
+function scheduleBasePreviewUpdate() {
+  saveCurrentParams();
+  if (!canBasePreviewUpdate()) return;
+  clearTimeout(state.previewTimer);
+  state.previewRevision += 1;
+  state.previewTimer = setTimeout(() => {
+    refreshBasePreview();
+  }, 80);
+}
+
 function scheduleFastPreviewUpdate() {
   saveCurrentParams();
-  if (!canFastPreviewUpdate()) return;
+  if (!canFastPreviewUpdate()) {
+    scheduleBasePreviewUpdate();
+    return;
+  }
   clearTimeout(state.previewTimer);
   state.previewTimer = setTimeout(() => {
     refreshManualPreview();
@@ -1938,12 +2416,55 @@ function scheduleFastPreviewUpdate() {
 function scheduleSmartPreviewUpdate() {
   saveCurrentParams();
   const output = state.outputs[state.activeTargetIndex];
-  if (!output) return;
+  if (!output) {
+    scheduleBasePreviewUpdate();
+    return;
+  }
   const params = state.targetParams[state.activeTargetIndex] || readParamsFromControls();
-  if (!coreParamsEqual(output.coreParams, coreParamsFromSettings(params)) || output.maxEdge !== Number(dom.sizeSelect.value)) {
+  if (output.toneMatched && (!coreParamsEqual(output.coreParams, coreParamsFromSettings(params)) || output.maxEdge !== Number(dom.sizeSelect.value))) {
     scheduleLivePreviewUpdate();
   } else {
     scheduleFastPreviewUpdate();
+  }
+}
+
+async function refreshBasePreview() {
+  if (!canBasePreviewUpdate()) return;
+  if (state.previewBusy) {
+    state.previewQueued = true;
+    return;
+  }
+  const revision = state.previewRevision + 1;
+  state.previewRevision = revision;
+  const index = state.activeTargetIndex;
+  const file = state.targets[index];
+  const params = state.targetParams[index] || readParamsFromControls();
+  state.previewBusy = true;
+  try {
+    const selectedMaxEdge = Number(dom.sizeSelect.value);
+    const previewMaxEdge = selectedMaxEdge || MAX_LIVE_PREVIEW_EDGE;
+    const output = await processBaseTarget(file, index, state.targets.length, params, {
+      maxEdge: previewMaxEdge,
+      previewOnly: selectedMaxEdge === 0,
+      label: "正在显示素材结果",
+      progressBase: 4,
+      progressSpan: 24,
+    });
+    if (revision !== state.previewRevision || index !== state.activeTargetIndex) {
+      if (output.url) URL.revokeObjectURL(output.url);
+      return;
+    }
+    replaceOutput(index, output);
+    setStatus(`结果区已显示：${file.name}`, 100);
+  } catch (error) {
+    console.error(error);
+    setStatus(`结果预览失败：${error.message}`, 0);
+  } finally {
+    state.previewBusy = false;
+    if (state.previewQueued) {
+      state.previewQueued = false;
+      scheduleSmartPreviewUpdate();
+    }
   }
 }
 
@@ -1982,12 +2503,22 @@ async function refreshManualPreview() {
 async function ensureOutputCoreCurrent(index) {
   let output = state.outputs[index];
   const file = state.targets[index];
-  if (!output || !file || !state.refStats) return output;
+  if (!file) return output;
   const params = state.targetParams[index] || output.params || defaultParams();
+  if (!output || !output.toneMatched) {
+    const freshOutput = await processBaseTarget(file, index, state.targets.length, params, {
+      maxEdge: Number(dom.sizeSelect.value),
+      previewOnly: false,
+      label: "正在生成导出结果",
+    });
+    replaceOutput(index, freshOutput, index === state.activeTargetIndex);
+    return freshOutput;
+  }
+  if (!state.refStats) return output;
   const nextCoreParams = coreParamsFromSettings(params);
   if (coreParamsEqual(output.coreParams, nextCoreParams) && output.maxEdge === Number(dom.sizeSelect.value)) return output;
   const freshOutput = await processTarget(file, state.refStats, index, state.targets.length, params);
-  replaceOutput(index, freshOutput);
+  replaceOutput(index, freshOutput, index === state.activeTargetIndex);
   output = freshOutput;
   return output;
 }
@@ -2010,18 +2541,67 @@ async function exportOutput(index) {
 }
 
 async function exportAllOutputs() {
-  if (!state.outputs.length) return;
+  if (!state.outputs.some(Boolean)) return;
   dom.downloadBtn.disabled = true;
   dom.downloadAllBtn.disabled = true;
   try {
+    let exported = 0;
     for (let i = 0; i < state.outputs.length; i += 1) {
+      if (!state.outputs[i]) continue;
       await exportOutput(i);
+      exported += 1;
       await nextFrame();
     }
-    setStatus(`已导出全部：${state.outputs.length} 张。`, 100);
+    setStatus(`已导出全部：${exported} 张。`, 100);
   } finally {
     dom.downloadBtn.disabled = !state.activeOutput;
-    dom.downloadAllBtn.disabled = state.outputs.length === 0;
+    dom.downloadAllBtn.disabled = !state.outputs.some(Boolean);
+  }
+}
+
+async function importUserLut(layer) {
+  const file = dom.lutInputs[layer]?.files?.[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const lut = parseCubeLut(text, file.name);
+    const entry = await saveLutEntry(file, text, lut);
+    if (dom.lutAmountRanges[layer] && Number(dom.lutAmountRanges[layer].value) === 0) {
+      dom.lutAmountRanges[layer].value = "100";
+    }
+    await selectUserLut(layer, entry.id);
+    setStatus(`已保存到 LUT 库并启用：${file.name}`, null);
+  } catch (error) {
+    console.error(error);
+    if (dom.lutInputs[layer]) dom.lutInputs[layer].value = "";
+    updateLutLabels();
+    setStatus(`LUT 导入失败：${error.message}`, 0);
+  }
+}
+
+function clearUserLut(layer) {
+  state.userLuts[layer] = { id: "", name: "", lut: null };
+  if (dom.lutInputs[layer]) dom.lutInputs[layer].value = "";
+  persistActiveLutIds();
+  renderLutLibrary();
+  saveCurrentParams();
+  scheduleSmartPreviewUpdate();
+  setStatus(`已清除 LUT ${layer + 1}。`, null);
+}
+
+async function deleteSelectedLut(layer) {
+  const id = dom.lutSelects[layer]?.value || state.userLuts[layer]?.id;
+  if (!id) {
+    setStatus("请先在 LUT 库里选择要删除的 LUT。", null);
+    return;
+  }
+  const entry = state.lutLibrary.find((item) => item.id === id);
+  try {
+    await deleteLutEntry(id);
+    setStatus(`已从 LUT 库删除：${entry?.name || "LUT"}`, null);
+  } catch (error) {
+    console.error(error);
+    setStatus(`删除 LUT 失败：${error.message}`, 0);
   }
 }
 
@@ -2106,7 +2686,24 @@ function bindEvents() {
     dom.qualityValue.textContent = `${dom.qualityRange.value}%`;
     setStatus("导出质量已更新，预览不需要重新渲染。", null);
   });
-  dom.sizeSelect.addEventListener("change", scheduleLivePreviewUpdate);
+  for (let layer = 0; layer < dom.lutInputs.length; layer += 1) {
+    dom.pickLutBtns[layer]?.addEventListener("click", () => dom.lutInputs[layer]?.click());
+    dom.clearLutBtns[layer]?.addEventListener("click", () => clearUserLut(layer));
+    dom.deleteLutBtns[layer]?.addEventListener("click", () => {
+      deleteSelectedLut(layer);
+    });
+    dom.lutSelects[layer]?.addEventListener("change", () => {
+      selectUserLut(layer, dom.lutSelects[layer].value);
+    });
+    dom.lutInputs[layer]?.addEventListener("change", () => {
+      importUserLut(layer);
+    });
+    dom.lutAmountRanges[layer]?.addEventListener("input", () => {
+      updateLutLabels();
+      scheduleSmartPreviewUpdate();
+    });
+  }
+  dom.sizeSelect.addEventListener("change", scheduleSmartPreviewUpdate);
   dom.formatSelect.addEventListener("change", () => {
     setStatus("导出格式已更新，预览不需要重新渲染。", null);
   });
@@ -2127,20 +2724,44 @@ function bindEvents() {
     });
     input.addEventListener("dblclick", () => resetControlToZero(input));
   }
+  const targetMedia = dom.targetPreview.closest(".preview-media");
+  const previewViewAreas = [targetMedia, dom.compareStage].filter(Boolean);
+  for (const area of previewViewAreas) {
+    area.addEventListener("wheel", (event) => {
+      if (!isPreviewViewGesture(event)) return;
+      zoomPreviewView(event.deltaY, event.clientX, event.clientY, area);
+      event.preventDefault();
+    }, { passive: false });
+    area.addEventListener("dblclick", (event) => {
+      if (!isPreviewViewGesture(event)) return;
+      resetPreviewView();
+      event.preventDefault();
+    });
+  }
+  if (targetMedia) {
+    targetMedia.addEventListener("pointerdown", beginPreviewPan);
+    targetMedia.addEventListener("pointermove", movePreviewPan);
+    for (const eventName of ["pointerup", "pointercancel", "pointerleave"]) {
+      targetMedia.addEventListener(eventName, endPreviewPan);
+    }
+  }
   dom.compareStage.addEventListener("pointerdown", (event) => {
     if (!state.activeOutput) return;
+    if (beginPreviewPan(event)) return;
     state.compareDragging = true;
     dom.compareStage.setPointerCapture?.(event.pointerId);
     updateCompareFromClientX(event.clientX);
     event.preventDefault();
   });
   dom.compareStage.addEventListener("pointermove", (event) => {
+    if (movePreviewPan(event)) return;
     if (!state.compareDragging) return;
     updateCompareFromClientX(event.clientX);
     event.preventDefault();
   });
   for (const eventName of ["pointerup", "pointercancel", "pointerleave"]) {
     dom.compareStage.addEventListener(eventName, (event) => {
+      endPreviewPan(event);
       if (!state.compareDragging) return;
       state.compareDragging = false;
       if (dom.compareStage.hasPointerCapture?.(event.pointerId)) {
@@ -2171,9 +2792,20 @@ function bindEvents() {
   }
 }
 
-applyTheme(initialTheme());
-renderHslControls();
-updateAdjustmentLabels();
-updateHslLabels();
-bindEvents();
-refreshFileLists();
+async function initializeApp() {
+  applyTheme(initialTheme());
+  renderHslControls();
+  updateAdjustmentLabels();
+  updateHslLabels();
+  updateLutLabels();
+  applyPreviewViewTransform();
+  bindEvents();
+  refreshFileLists();
+  await loadLutLibrary();
+  await restoreActiveLuts();
+}
+
+initializeApp().catch((error) => {
+  console.error(error);
+  setStatus(`初始化失败：${error.message}`, 0);
+});
