@@ -21,6 +21,7 @@ const dom = {
   formatSelect: document.getElementById("formatSelect"),
   qualityRange: document.getElementById("qualityRange"),
   qualityValue: document.getElementById("qualityValue"),
+  themeToggle: document.getElementById("themeToggle"),
   statusLine: document.getElementById("statusLine"),
   progressBar: document.getElementById("progressBar"),
   processBtn: document.getElementById("processBtn"),
@@ -38,6 +39,7 @@ const dom = {
   refThumbs: document.getElementById("refThumbs"),
   targetThumbs: document.getElementById("targetThumbs"),
   resultThumbs: document.getElementById("resultThumbs"),
+  resultList: document.getElementById("resultList"),
   refEmpty: document.getElementById("refEmpty"),
   targetEmpty: document.getElementById("targetEmpty"),
   resultEmpty: document.getElementById("resultEmpty"),
@@ -109,9 +111,34 @@ const HSL_AXES = [
   { key: "l", title: "明度", hint: "Luminance" },
 ];
 const SAMPLE_APPEND_CHUNK = 12000;
+const THEME_STORAGE_KEY = "reference-tone-match-theme";
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function applyTheme(theme) {
+  const nextTheme = theme === "dark" ? "dark" : "light";
+  document.body.dataset.theme = nextTheme;
+  if (dom.themeToggle) {
+    dom.themeToggle.textContent = nextTheme === "dark" ? "日间模式" : "夜间模式";
+    dom.themeToggle.setAttribute("aria-pressed", String(nextTheme === "dark"));
+  }
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
+  } catch (error) {
+    // Ignore private browsing storage failures.
+  }
+}
+
+function initialTheme() {
+  try {
+    const stored = localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === "dark" || stored === "light") return stored;
+  } catch (error) {
+    // Ignore private browsing storage failures.
+  }
+  return "light";
 }
 
 function deepClone(value) {
@@ -395,6 +422,38 @@ function fitRgbToLuma(r, g, b, targetY) {
 function scaleChroma(r, g, b, targetY, scale) {
   const y = luma(r, g, b);
   return fitRgbToLuma(y + (r - y) * scale, y + (g - y) * scale, y + (b - y) * scale, targetY);
+}
+
+function skinRgbFromStats(y, redGreen, greenBlue) {
+  const chromaScale = smoothstep(0.12, 0.42, y) * (1 - smoothstep(0.82, 0.96, y));
+  const rg = clamp(redGreen, -0.015, 0.17) * chromaScale;
+  const gb = clamp(greenBlue, 0.015, 0.15) * chromaScale;
+  const g = y - 0.2126 * rg + 0.0722 * gb;
+  return [g + rg, g, g - gb].map(clamp01);
+}
+
+function refineSkinTone(r, g, b, skinConfidence, refStats, targetStats, strength, highlightMask) {
+  if (skinConfidence <= 0.001 || refStats.skinSampleCount < 80) return [r, g, b];
+  const currentY = luma(r, g, b);
+  const sourceHsv = rgbToHsv(r, g, b);
+  const highlightSkin = smoothstep(0.56, 0.90, currentY);
+  const targetRg = targetStats.skinSampleCount >= 80 ? targetStats.skinRedGreen : clamp(r - g, 0.02, 0.14);
+  const targetGb = targetStats.skinSampleCount >= 80 ? targetStats.skinGreenBlue : clamp(g - b, 0.02, 0.13);
+  const desiredRg = clamp(targetRg + (refStats.skinRedGreen - targetRg) * strength * 0.52, 0.018, 0.15);
+  const desiredGb = clamp(targetGb + (refStats.skinGreenBlue - targetGb) * strength * 0.62, 0.025, 0.14);
+  const targetSkin = skinRgbFromStats(currentY, desiredRg, desiredGb);
+  const pinkBias = smoothstep(330 / 360, 350 / 360, sourceHsv.h) + smoothstep(0, 12 / 360, sourceHsv.h) * (1 - smoothstep(22 / 360, 38 / 360, sourceHsv.h));
+  const axisWeight = skinConfidence * strength * (0.30 + 0.22 * highlightSkin + 0.16 * clamp(pinkBias, 0, 1)) * (1 - highlightMask * 0.12);
+
+  let tr = mix(r, targetSkin[0], axisWeight);
+  let tg = mix(g, targetSkin[1], axisWeight);
+  let tb = mix(b, targetSkin[2], axisWeight);
+  const nextY = luma(tr, tg, tb);
+  const desat = skinConfidence * smoothstep(0.52, 0.92, nextY) * 0.14;
+  tr = nextY + (tr - nextY) * (1 - desat);
+  tg = nextY + (tg - nextY) * (1 - desat);
+  tb = nextY + (tb - nextY) * (1 - desat);
+  return fitRgbToLuma(tr, tg, tb, nextY || currentY);
 }
 
 function softSkinConfidence(r, g, b, hsv, y) {
@@ -1071,12 +1130,12 @@ function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, 
   }
 
   if (skinConfidence > 0.001 && refStats.skinSampleCount >= 80 && targetStats.skinSampleCount >= 80) {
-    const skinW = skinConfidence * strength * (settings.skinProtect ? 0.46 : 0.62) * (1 - highlightMask * 0.20);
-    const skinSatTarget = clamp(refStats.skinSat, srcHsv.s * 0.70, srcHsv.s * 1.34);
+    const skinW = skinConfidence * strength * (settings.skinProtect ? 0.58 : 0.72) * (1 - highlightMask * 0.18);
+    const skinSatTarget = clamp(refStats.skinSat, srcHsv.s * 0.62, srcHsv.s * 1.26);
     const skinValueTarget = clamp(refStats.skinValue, srcHsv.v - 0.10, srcHsv.v + 0.10);
-    outHsv.h += clamp(circularDelta(outHsv.h, refStats.skinHue), -14 / 360, 14 / 360) * skinW * 0.34;
-    outHsv.s = mix(outHsv.s, skinSatTarget, skinW * 0.42);
-    outHsv.v = mix(outHsv.v, skinValueTarget, skinW * 0.30);
+    outHsv.h += clamp(circularDelta(outHsv.h, refStats.skinHue), -18 / 360, 18 / 360) * skinW * 0.46;
+    outHsv.s = mix(outHsv.s, skinSatTarget, skinW * 0.48);
+    outHsv.v = mix(outHsv.v, skinValueTarget, skinW * 0.26);
   }
 
   if (greenConfidence > 0.001 && refStats.greenSampleCount >= 40) {
@@ -1098,6 +1157,7 @@ function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, 
   }
 
   [tr, tg, tb] = hsvToRgb(outHsv.h, outHsv.s, outHsv.v);
+  [tr, tg, tb] = refineSkinTone(tr, tg, tb, skinConfidence, refStats, targetStats, strength, highlightMask);
   const finalY = clamp01(toneY + (totalWeight > 0.0001 ? (valueShift / totalWeight) * params.toneWeight * strength * 0.30 : 0));
   [tr, tg, tb] = fitRgbToLuma(tr, tg, tb, finalY);
 
@@ -1391,6 +1451,16 @@ function summarizeFiles(files) {
   return files.length > 7 ? `${names} ... 共 ${files.length} 张${suffix}` : `${names}，共 ${files.length} 张${suffix}`;
 }
 
+function summarizeOutputs(outputs) {
+  if (!outputs.length) return "未选择";
+  const names = outputs.slice(0, 7).map((output) => output.name).join("、");
+  return outputs.length > 7 ? `${names} ... 共 ${outputs.length} 张` : `${names}，共 ${outputs.length} 张`;
+}
+
+function updateResultList() {
+  if (dom.resultList) dom.resultList.textContent = summarizeOutputs(state.outputs);
+}
+
 function setPreview(imgEl, file, frameSelector, urlKind) {
   const frame = imgEl.closest(frameSelector);
   if (!file) {
@@ -1537,6 +1607,7 @@ function clearOutputs() {
   state.activeOutput = null;
   state.activeOutputIndex = -1;
   dom.resultThumbs.innerHTML = "";
+  updateResultList();
   dom.downloadBtn.disabled = true;
   dom.downloadAllBtn.disabled = true;
   dom.resultCanvas.closest(".preview-frame").classList.remove("has-media");
@@ -1637,6 +1708,7 @@ function addOutput(output) {
   const index = state.outputs.push(output) - 1;
   renderOutputThumbs();
   selectOutput(index);
+  updateResultList();
   dom.downloadAllBtn.disabled = false;
 }
 
@@ -1646,6 +1718,7 @@ function replaceOutput(index, output) {
   state.outputs[index] = output;
   renderOutputThumbs();
   selectOutput(index, false);
+  updateResultList();
   dom.downloadAllBtn.disabled = state.outputs.length === 0;
 }
 
@@ -2091,8 +2164,14 @@ function bindEvents() {
   dom.downloadAllBtn.addEventListener("click", async () => {
     await exportAllOutputs();
   });
+  if (dom.themeToggle) {
+    dom.themeToggle.addEventListener("click", () => {
+      applyTheme(document.body.dataset.theme === "dark" ? "light" : "dark");
+    });
+  }
 }
 
+applyTheme(initialTheme());
 renderHslControls();
 updateAdjustmentLabels();
 updateHslLabels();
