@@ -127,8 +127,16 @@ button:disabled {
   align-items: center;
 }
 
-.toolbar-actions .process-button {
+.process-pair {
   grid-row: 1 / 3;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  min-width: 0;
+}
+
+.toolbar-actions .process-button,
+.toolbar-actions .restore-button {
   min-height: 70px;
 }
 
@@ -234,6 +242,7 @@ h2 {
 .secondary-pick,
 .process-button,
 .download-button,
+.restore-button,
 .theme-toggle {
   width: 100%;
   min-height: 42px;
@@ -517,6 +526,12 @@ input[type="range"] {
   color: #fff;
 }
 
+.restore-button {
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--ink);
+}
+
 .theme-toggle {
   min-height: 70px;
   border: 0;
@@ -526,6 +541,11 @@ input[type="range"] {
 
 .process-button:hover {
   background: var(--accent-strong);
+}
+
+.restore-button:hover {
+  border-color: var(--accent);
+  color: var(--accent-strong);
 }
 
 .theme-toggle:hover {
@@ -1099,7 +1119,8 @@ input[type="range"] {
   }
 
   .theme-toggle,
-  .toolbar-actions .process-button {
+  .toolbar-actions .process-button,
+  .toolbar-actions .restore-button {
     min-height: 44px;
   }
 
@@ -1108,7 +1129,7 @@ input[type="range"] {
     grid-template-rows: none;
   }
 
-  .toolbar-actions .process-button {
+  .process-pair {
     grid-row: auto;
   }
 

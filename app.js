@@ -34,6 +34,7 @@ const dom = {
   statusLine: document.getElementById("statusLine"),
   progressBar: document.getElementById("progressBar"),
   processBtn: document.getElementById("processBtn"),
+  restoreBtn: document.getElementById("restoreBtn"),
   downloadBtn: document.getElementById("downloadBtn"),
   downloadAllBtn: document.getElementById("downloadAllBtn"),
   copyParamsBtn: document.getElementById("copyParamsBtn"),
@@ -843,14 +844,19 @@ function buildStats(samples) {
 
   const p25 = quantileSorted(ySorted, 0.25);
   const p75 = quantileSorted(ySorted, 0.75);
+  const p10 = quantileSorted(ySorted, 0.10);
+  const p90 = quantileSorted(ySorted, 0.90);
   const stats = {
     quantiles: smoothQuantiles,
     balanceRows: smoothRows(balanceRows, 4),
     hueSatRows: smoothCircular(hueSatRows, 3),
     hueValueRows: smoothCircular(hueValueRows, 3),
     satP60: fallbackSat,
+    lumaP10: p10,
     lumaMedian: quantileSorted(ySorted, 0.5),
+    lumaP90: p90,
     contrast: Math.max(0.05, p75 - p25),
+    tonalWidth: Math.max(0.08, p90 - p10),
     skinHue: skinHues.length >= 80 ? median(skinHues, 26 / 360) : 26 / 360,
     skinSat: skinSats.length >= 80 ? clamp(median(skinSats, 0.22), 0.06, 0.44) : 0.22,
     skinValue: skinValues.length >= 80 ? clamp(quantile(skinValues, 0.58, 0.62), 0.16, 0.94) : 0.62,
@@ -913,21 +919,29 @@ function analyzeImageData(imageData) {
 function createToneMapper(refStats, targetStats, settings, params) {
   const toneCurve = [];
   const strength = settings.strength;
-  const medianShift = clamp(refStats.lumaMedian - targetStats.lumaMedian, -0.18, 0.18) * params.toneWeight * 0.30;
-  const contrastScale = clamp(Math.pow(refStats.contrast / Math.max(0.05, targetStats.contrast), 0.55), 0.68, 1.46);
-  const localBoost = 0.84 + settings.localStrength * 0.36;
+  const medianShift = clamp(refStats.lumaMedian - targetStats.lumaMedian, -0.16, 0.16) * params.toneWeight * 0.22;
+  const contrastScale = clamp(Math.pow(refStats.tonalWidth / Math.max(0.08, targetStats.tonalWidth), 0.42), 0.78, 1.34);
+  const localBoost = 0.72 + settings.localStrength * 0.28;
+  const lowContrastRef = clamp((targetStats.tonalWidth - refStats.tonalWidth) / Math.max(0.12, targetStats.tonalWidth), 0, 1);
+  const brightRefLift = clamp(refStats.lumaMedian - targetStats.lumaMedian, 0, 0.28);
   for (let i = 0; i <= 256; i += 1) {
     const srcY = targetStats.quantiles[i];
     const q = i / 256;
     const refY = refStats.quantiles[i];
     const midMask = Math.max(0, Math.sin(Math.PI * srcY));
     const directMatch = srcY + (refY - srcY) * params.toneWeight * localBoost;
-    let filmY = 0.5 + (srcY - 0.5) * (1 + (contrastScale - 1) * params.toneWeight * 0.72);
+    let filmY = 0.5 + (srcY - 0.5) * (1 + (contrastScale - 1) * params.toneWeight * 0.62);
     filmY += medianShift;
-    const styleY = mix(filmY, directMatch, 0.74);
+    let styleY = mix(filmY, directMatch, 0.58);
     const edgeGuard = 0.62 + 0.38 * midMask;
-    const deltaLimit = params.maxToneDelta * edgeGuard * (0.70 + 0.30 * (1 - Math.abs(q - 0.5) * 2));
-    const protectedY = clamp(styleY, srcY - deltaLimit, srcY + deltaLimit);
+    const toneZone = smoothstep(0.30, 0.88, srcY);
+    const liftGuard = 1 - clamp(toneZone * (0.28 + lowContrastRef * 0.32 + brightRefLift * 0.85), 0, 0.58);
+    const deltaLimit = params.maxToneDelta * edgeGuard * (0.58 + 0.26 * (1 - Math.abs(q - 0.5) * 2));
+    if (styleY > srcY) {
+      const maxLift = deltaLimit * liftGuard * (0.72 - 0.26 * smoothstep(0.52, 0.92, srcY));
+      styleY = Math.min(styleY, srcY + maxLift);
+    }
+    const protectedY = clamp(styleY, srcY - deltaLimit * 0.88, srcY + deltaLimit);
     toneCurve.push(clamp01(srcY + (protectedY - srcY) * strength));
   }
   toneCurve[0] = 0;
@@ -1093,22 +1107,38 @@ function hslProfileConfidence(refProfile, targetProfile) {
   return clamp(0.25 + 0.75 * refWeight * targetWeight, 0, 1);
 }
 
+function protectMaterialTone(srcY, targetY, hsv, greenConfidence, skinConfidence, strength) {
+  if (targetY <= srcY) return targetY;
+  const saturatedMask = smoothstep(0.10, 0.36, hsv.s) * (1 - smoothstep(0.88, 0.99, srcY));
+  const plantMask = greenConfidence * (0.70 + 0.30 * saturatedMask);
+  const protect = clamp((plantMask * 0.88 + saturatedMask * 0.24) * (0.72 + strength * 0.28) * (1 - skinConfidence * 0.24), 0, 0.88);
+  const maxLift = 0.032 + 0.070 * (1 - smoothstep(0.22, 0.94, srcY));
+  const guarded = srcY + Math.min(targetY - srcY, maxLift);
+  return mix(targetY, guarded, protect);
+}
+
 function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, params) {
   const srcY = luma(r, g, b);
   const srcHsv = rgbToHsv(r, g, b);
   const strength = settings.strength;
-  const toneY = interpCurve(targetStats.quantiles, toneCurve, srcY);
   const highlightMask = smoothstep(0.74, 0.98, srcY);
   const shadowMask = 1 - smoothstep(0.05, 0.34, srcY);
   const colorMask = smoothstep(0.025, 0.16, srcHsv.s);
   const skinConfidence = settings.skinProtect ? softSkinConfidence(r, g, b, srcHsv, srcY) : 0;
   const redConfidence = redAccentConfidence(srcHsv, srcY) * (1 - skinConfidence * 0.72);
-  const greenConfidence = greenPlantConfidence(srcHsv, srcY) * (1 - skinConfidence * 0.86) * (1 - redConfidence * 0.55);
+  const greenHueConfidence = Math.max(
+    greenPlantConfidence(srcHsv, srcY),
+    hslChannelWeight("green", srcHsv.h, srcHsv.s) * 0.88,
+    hslChannelWeight("aqua", srcHsv.h, srcHsv.s) * 0.62
+  );
+  const greenConfidence = greenHueConfidence * (1 - skinConfidence * 0.86) * (1 - redConfidence * 0.55);
+  const toneY = protectMaterialTone(srcY, interpCurve(targetStats.quantiles, toneCurve, srcY), srcHsv, greenConfidence, skinConfidence, strength);
 
   let [tr, tg, tb] = fitRgbToLuma(r, g, b, toneY);
   const sourceRatio = interpRow(targetStats.balanceRows, srcY);
   const referenceRatio = interpRow(refStats.balanceRows, toneY);
-  const balanceStrength = params.colorWeight * strength * (0.74 + settings.localStrength * 0.28) * (1 - skinConfidence * 0.20) * (1 - highlightMask * 0.16);
+  const materialBalanceGuard = 1 - clamp(greenConfidence * 0.30 + smoothstep(0.16, 0.48, srcHsv.s) * highlightMask * 0.14, 0, 0.42);
+  const balanceStrength = params.colorWeight * strength * (0.68 + settings.localStrength * 0.24) * (1 - skinConfidence * 0.20) * (1 - highlightMask * 0.18) * materialBalanceGuard;
   const correction = [
     clamp(referenceRatio[0] / Math.max(0.0001, sourceRatio[0]), 1 / params.maxColorRatio, params.maxColorRatio),
     clamp(referenceRatio[1] / Math.max(0.0001, sourceRatio[1]), 1 / params.maxColorRatio, params.maxColorRatio),
@@ -1133,8 +1163,9 @@ function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, 
     const w = weight * confidence * colorMask;
     if (w <= 0.0001) continue;
     const hueMove = clamp(circularDelta(targetProfile.hue, refProfile.hue), -38 / 360, 38 / 360);
-    const satRatio = clamp(refProfile.sat / Math.max(0.015, targetProfile.sat), 0.48, 1.95);
-    const valDelta = clamp(refProfile.value - targetProfile.value, -0.22, 0.22);
+    const isGreenChannel = channel === "green" || channel === "aqua";
+    const satRatio = clamp(refProfile.sat / Math.max(0.015, targetProfile.sat), isGreenChannel ? 0.88 : 0.48, isGreenChannel ? 1.62 : 1.95);
+    const valDelta = clamp(refProfile.value - targetProfile.value, isGreenChannel ? -0.16 : -0.22, isGreenChannel ? 0.10 : 0.22);
     hueDelta += hueMove * w;
     satLog += Math.log(satRatio) * w;
     valueShift += valDelta * w;
@@ -1170,12 +1201,20 @@ function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, 
   }
 
   if (greenConfidence > 0.001 && refStats.greenSampleCount >= 40) {
-    const greenW = greenConfidence * strength * (0.74 + settings.localStrength * 0.22) * (1 - highlightMask * 0.12);
-    const greenSatTarget = clamp(refStats.greenSatP75 * 0.92, srcHsv.s * 0.62, srcHsv.s * 1.55);
-    const greenValueTarget = clamp(refStats.greenValueP70, srcHsv.v - 0.12, srcHsv.v + 0.14);
+    const greenW = greenConfidence * strength * (0.74 + settings.localStrength * 0.22) * (1 - highlightMask * 0.18);
+    const greenSatFloor = srcHsv.s * (toneY > srcY ? 0.86 : 0.76);
+    const greenSatTarget = clamp(refStats.greenSatP75 * 1.02, greenSatFloor, srcHsv.s * 1.42);
+    const greenValueTarget = clamp(refStats.greenValueP70, srcHsv.v - 0.12, srcHsv.v + 0.065);
     outHsv.h += circularDelta(outHsv.h, refStats.greenHue) * greenW * 0.34;
-    outHsv.s = mix(outHsv.s, greenSatTarget, greenW * 0.58);
-    outHsv.v = mix(outHsv.v, greenValueTarget, greenW * 0.42);
+    outHsv.s = mix(outHsv.s, greenSatTarget, greenW * 0.68);
+    outHsv.v = mix(outHsv.v, greenValueTarget, greenW * 0.30);
+  }
+
+  if (greenConfidence > 0.001) {
+    const minGreenSat = srcHsv.s * (toneY > srcY ? 0.84 : 0.76);
+    if (outHsv.s < minGreenSat) {
+      outHsv.s = mix(outHsv.s, minGreenSat, greenConfidence * strength * 0.82);
+    }
   }
 
   if (redConfidence > 0.001 && refStats.redSampleCount >= 40) {
@@ -1189,7 +1228,11 @@ function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, 
 
   [tr, tg, tb] = hsvToRgb(outHsv.h, outHsv.s, outHsv.v);
   [tr, tg, tb] = refineSkinTone(tr, tg, tb, skinConfidence, refStats, targetStats, strength, highlightMask);
-  const finalY = clamp01(toneY + (totalWeight > 0.0001 ? (valueShift / totalWeight) * params.toneWeight * strength * 0.30 : 0));
+  let finalY = clamp01(toneY + (totalWeight > 0.0001 ? (valueShift / totalWeight) * params.toneWeight * strength * 0.22 : 0));
+  finalY = protectMaterialTone(srcY, finalY, srcHsv, greenConfidence, skinConfidence, strength);
+  if (greenConfidence > 0.001 && finalY > srcY) {
+    finalY = Math.min(finalY, srcY + 0.045 + 0.030 * (1 - srcY));
+  }
   [tr, tg, tb] = fitRgbToLuma(tr, tg, tb, finalY);
 
   if (srcY < 0.015 || srcY > 0.985 || srcHsv.s < 0.012) {
@@ -1637,12 +1680,19 @@ function setStatus(text, progress = null) {
   if (progress !== null) dom.progressBar.style.width = `${clamp(progress, 0, 100)}%`;
 }
 
+function updateRestoreButton() {
+  if (!dom.restoreBtn) return;
+  const file = state.targets[state.activeTargetIndex];
+  dom.restoreBtn.disabled = Boolean(state.busy || state.liveBusy || !file || !canBrowserDecode(file));
+}
+
 function setBusy(busy) {
   state.busy = busy;
   dom.processBtn.disabled = busy;
   dom.pickRefsBtn.disabled = busy;
   dom.pickTargetsBtn.disabled = busy;
   dom.pickFolderBtn.disabled = busy;
+  updateRestoreButton();
 }
 
 function updateAdjustmentLabels() {
@@ -1988,6 +2038,7 @@ function selectTarget(index, syncOutput = true) {
   applyParamsToControls(state.targetParams[state.activeTargetIndex] || defaultParams());
   if (syncOutput && state.outputs[state.activeTargetIndex]) selectOutput(state.activeTargetIndex, false);
   else if (syncOutput) scheduleBasePreviewUpdate();
+  updateRestoreButton();
 }
 
 function refreshFileLists() {
@@ -2000,6 +2051,7 @@ function refreshFileLists() {
   renderFileThumbs(state.targets, dom.targetThumbs, "targets", state.activeTargetIndex, selectTarget);
   selectReference(state.activeRefIndex);
   selectTarget(state.activeTargetIndex);
+  updateRestoreButton();
 }
 
 function clearOutputs() {
@@ -2020,6 +2072,7 @@ function clearOutputs() {
   clearCanvas(dom.beforeCanvas);
   clearCanvas(dom.resultCanvas);
   setComparePosition(50);
+  updateRestoreButton();
 }
 
 function outputName(fileName, format) {
@@ -2330,6 +2383,37 @@ async function processAll() {
   }
 }
 
+async function restoreActiveOutput() {
+  if (state.busy || state.liveBusy) return;
+  const index = state.activeTargetIndex;
+  const file = state.targets[index];
+  if (!file) {
+    setStatus("请先选择素材图。", 0);
+    return;
+  }
+  if (!canBrowserDecode(file)) {
+    setStatus(`还原失败：${file.name} 是 RAW/浏览器不可解码文件。`, 0);
+    return;
+  }
+  saveCurrentParams();
+  ensureTargetParams();
+  setBusy(true);
+  try {
+    const output = await processBaseTarget(file, index, state.targets.length || 1, state.targetParams[index] || readParamsFromControls(), {
+      maxEdge: Number(dom.sizeSelect.value),
+      previewOnly: false,
+      label: "正在还原",
+    });
+    replaceOutput(index, output);
+    setStatus(`已还原为仿色前：${file.name}`, 100);
+  } catch (error) {
+    console.error(error);
+    setStatus(`还原失败：${error.message}`, 0);
+  } finally {
+    setBusy(false);
+  }
+}
+
 function canLiveUpdate() {
   const output = state.outputs[state.activeTargetIndex];
   return Boolean(
@@ -2364,6 +2448,7 @@ async function refreshActiveOutput() {
   const params = state.targetParams[index] || readParamsFromControls();
   state.liveBusy = true;
   dom.processBtn.disabled = true;
+  updateRestoreButton();
   try {
     const output = await processTarget(file, state.refStats, index, state.targets.length, params);
     replaceOutput(index, output);
@@ -2374,6 +2459,7 @@ async function refreshActiveOutput() {
   } finally {
     state.liveBusy = false;
     dom.processBtn.disabled = state.busy;
+    updateRestoreButton();
     if (state.liveQueued) {
       state.liveQueued = false;
       scheduleLivePreviewUpdate();
@@ -2779,6 +2865,7 @@ function bindEvents() {
     event.preventDefault();
   });
   dom.processBtn.addEventListener("click", processAll);
+  dom.restoreBtn?.addEventListener("click", restoreActiveOutput);
   dom.downloadBtn.addEventListener("click", async () => {
     if (state.activeOutputIndex >= 0) await exportOutput(state.activeOutputIndex);
   });
