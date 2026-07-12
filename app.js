@@ -434,6 +434,21 @@ function modeParams(mode) {
   return { toneWeight: 0.86, colorWeight: 0.76, satWeight: 0.66, hueWeight: 0.56, maxToneDelta: 0.26, maxColorRatio: 1.36 };
 }
 
+function referenceLiftIntent(refStats, targetStats) {
+  const midKeyRef = smoothstep(0.15, 0.34, refStats.lumaMedian) * 0.72;
+  const brightKeyRef = smoothstep(0.52, 0.78, refStats.lumaP90) * 0.28;
+  const highKeyRef = clamp(midKeyRef + brightKeyRef, 0, 1);
+  const targetNeedsLift = smoothstep(0.025, 0.17, refStats.lumaMedian - targetStats.lumaMedian);
+  const softerContrast = smoothstep(0.02, 0.18, targetStats.tonalWidth - refStats.tonalWidth);
+  return clamp(highKeyRef * targetNeedsLift * (0.76 + softerContrast * 0.24), 0, 1);
+}
+
+function referenceSaturationIntent(refStats, targetStats) {
+  const refHasColor = smoothstep(0.24, 0.58, refStats.satP60);
+  const needsColor = smoothstep(0.04, 0.24, refStats.satP60 - targetStats.satP60);
+  return clamp(refHasColor * needsColor, 0, 1);
+}
+
 function fitRgbToLuma(r, g, b, targetY) {
   const y = luma(r, g, b);
   const deltas = [r - y, g - y, b - y];
@@ -919,7 +934,8 @@ function analyzeImageData(imageData) {
 function createToneMapper(refStats, targetStats, settings, params) {
   const toneCurve = [];
   const strength = settings.strength;
-  const medianShift = clamp(refStats.lumaMedian - targetStats.lumaMedian, -0.16, 0.16) * params.toneWeight * 0.22;
+  const liftIntent = referenceLiftIntent(refStats, targetStats);
+  const medianShift = clamp(refStats.lumaMedian - targetStats.lumaMedian, -0.18, 0.18) * params.toneWeight * (0.22 + liftIntent * 0.24);
   const contrastScale = clamp(Math.pow(refStats.tonalWidth / Math.max(0.08, targetStats.tonalWidth), 0.42), 0.78, 1.34);
   const localBoost = 0.72 + settings.localStrength * 0.28;
   const lowContrastRef = clamp((targetStats.tonalWidth - refStats.tonalWidth) / Math.max(0.12, targetStats.tonalWidth), 0, 1);
@@ -933,9 +949,10 @@ function createToneMapper(refStats, targetStats, settings, params) {
     let filmY = 0.5 + (srcY - 0.5) * (1 + (contrastScale - 1) * params.toneWeight * 0.62);
     filmY += medianShift;
     let styleY = mix(filmY, directMatch, 0.58);
+    styleY += liftIntent * midMask * (1 - smoothstep(0.82, 0.98, srcY)) * params.toneWeight * localBoost * 0.082;
     const edgeGuard = 0.62 + 0.38 * midMask;
     const toneZone = smoothstep(0.30, 0.88, srcY);
-    const liftGuard = 1 - clamp(toneZone * (0.28 + lowContrastRef * 0.32 + brightRefLift * 0.85), 0, 0.58);
+    const liftGuard = 1 - clamp(toneZone * (0.28 + lowContrastRef * 0.26 + brightRefLift * (0.64 - liftIntent * 0.28)), 0, 0.50);
     const deltaLimit = params.maxToneDelta * edgeGuard * (0.58 + 0.26 * (1 - Math.abs(q - 0.5) * 2));
     if (styleY > srcY) {
       const maxLift = deltaLimit * liftGuard * (0.72 - 0.26 * smoothstep(0.52, 0.92, srcY));
@@ -1033,10 +1050,11 @@ function matchPixel(r, g, b, a, refStats, targetStats, toneCurve, settings, para
   let [tr, tg, tb] = fitRgbToLuma(r, g, b, desiredY);
   const tonedY = desiredY;
 
-  const globalSatFactor = clamp(Math.pow(Math.max(0.02, refStats.satP60) / Math.max(0.02, targetStats.satP60), 0.22), 0.86, 1.12);
+  const satIntent = referenceSaturationIntent(refStats, targetStats);
+  const globalSatFactor = clamp(Math.pow(Math.max(0.02, refStats.satP60) / Math.max(0.02, targetStats.satP60), 0.24), 0.84, 1.12 + satIntent * 0.06);
   const refHueSat = Math.max(0.02, interpCircular(refStats.hueSatRows, hsv.h));
   const targetHueSat = Math.max(0.02, interpCircular(targetStats.hueSatRows, hsv.h));
-  const hueSatFactor = clamp(Math.pow(refHueSat / targetHueSat, 0.16), 0.90, 1.10);
+  const hueSatFactor = clamp(Math.pow(refHueSat / targetHueSat, 0.18), 0.90, 1.10 + satIntent * 0.05);
   const materialGuard = 1 - clamp(redConfidence * 0.68 + skinConfidence * 0.46 + highlightMask * 0.22, 0, 0.76);
   const satTarget = globalSatFactor * (1 + (hueSatFactor - 1) * params.hueWeight);
   let satFactor = 1 + (satTarget - 1) * strength * params.satWeight * skinProtect * materialGuard;
@@ -1107,12 +1125,12 @@ function hslProfileConfidence(refProfile, targetProfile) {
   return clamp(0.25 + 0.75 * refWeight * targetWeight, 0, 1);
 }
 
-function protectMaterialTone(srcY, targetY, hsv, greenConfidence, skinConfidence, strength) {
+function protectMaterialTone(srcY, targetY, hsv, greenConfidence, skinConfidence, strength, liftIntent = 0) {
   if (targetY <= srcY) return targetY;
   const saturatedMask = smoothstep(0.10, 0.36, hsv.s) * (1 - smoothstep(0.88, 0.99, srcY));
   const plantMask = greenConfidence * (0.70 + 0.30 * saturatedMask);
-  const protect = clamp((plantMask * 0.88 + saturatedMask * 0.24) * (0.72 + strength * 0.28) * (1 - skinConfidence * 0.24), 0, 0.88);
-  const maxLift = 0.032 + 0.070 * (1 - smoothstep(0.22, 0.94, srcY));
+  const protect = clamp((plantMask * 0.88 + saturatedMask * 0.24) * (0.72 + strength * 0.28) * (1 - skinConfidence * 0.24) * (1 - liftIntent * 0.36), 0, 0.88);
+  const maxLift = 0.032 + 0.070 * (1 - smoothstep(0.22, 0.94, srcY)) + liftIntent * (0.032 + greenConfidence * 0.062) * (1 - smoothstep(0.78, 0.98, srcY));
   const guarded = srcY + Math.min(targetY - srcY, maxLift);
   return mix(targetY, guarded, protect);
 }
@@ -1121,6 +1139,8 @@ function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, 
   const srcY = luma(r, g, b);
   const srcHsv = rgbToHsv(r, g, b);
   const strength = settings.strength;
+  const liftIntent = referenceLiftIntent(refStats, targetStats);
+  const satIntent = referenceSaturationIntent(refStats, targetStats);
   const highlightMask = smoothstep(0.74, 0.98, srcY);
   const shadowMask = 1 - smoothstep(0.05, 0.34, srcY);
   const colorMask = smoothstep(0.025, 0.16, srcHsv.s);
@@ -1132,7 +1152,7 @@ function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, 
     hslChannelWeight("aqua", srcHsv.h, srcHsv.s) * 0.62
   );
   const greenConfidence = greenHueConfidence * (1 - skinConfidence * 0.86) * (1 - redConfidence * 0.55);
-  const toneY = protectMaterialTone(srcY, interpCurve(targetStats.quantiles, toneCurve, srcY), srcHsv, greenConfidence, skinConfidence, strength);
+  const toneY = protectMaterialTone(srcY, interpCurve(targetStats.quantiles, toneCurve, srcY), srcHsv, greenConfidence, skinConfidence, strength, liftIntent);
 
   let [tr, tg, tb] = fitRgbToLuma(r, g, b, toneY);
   const sourceRatio = interpRow(targetStats.balanceRows, srcY);
@@ -1180,7 +1200,7 @@ function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, 
     totalWeight += w;
   }
 
-  const chromaStrength = strength * (0.82 + settings.localStrength * 0.30) * (1 - highlightMask * 0.18) * (1 - shadowMask * 0.06);
+  const chromaStrength = strength * (0.82 + settings.localStrength * 0.30 + satIntent * 0.06) * (1 - highlightMask * 0.16) * (1 - shadowMask * 0.06);
   let outHsv = rgbToHsv(tr, tg, tb);
   if (totalWeight > 0.0001) {
     const avgHueDelta = hueDelta / totalWeight;
@@ -1189,6 +1209,13 @@ function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, 
     outHsv.h += avgHueDelta * params.hueWeight * chromaStrength;
     outHsv.s = clamp01(outHsv.s * Math.exp(avgSatLog * params.satWeight * chromaStrength));
     outHsv.v = clamp01(outHsv.v + avgValueShift * params.toneWeight * chromaStrength * 0.62);
+  }
+
+  if (satIntent > 0.001 && colorMask > 0.001 && skinConfidence < 0.82) {
+    const minStyledSat = srcHsv.s * (1 + satIntent * 0.08);
+    if (outHsv.s < minStyledSat) {
+      outHsv.s = mix(outHsv.s, minStyledSat, colorMask * strength * satIntent * 0.24);
+    }
   }
 
   if (skinConfidence > 0.001 && refStats.skinSampleCount >= 80 && targetStats.skinSampleCount >= 80) {
@@ -1229,9 +1256,9 @@ function transformLutColor(r, g, b, refStats, targetStats, toneCurve, settings, 
   [tr, tg, tb] = hsvToRgb(outHsv.h, outHsv.s, outHsv.v);
   [tr, tg, tb] = refineSkinTone(tr, tg, tb, skinConfidence, refStats, targetStats, strength, highlightMask);
   let finalY = clamp01(toneY + (totalWeight > 0.0001 ? (valueShift / totalWeight) * params.toneWeight * strength * 0.22 : 0));
-  finalY = protectMaterialTone(srcY, finalY, srcHsv, greenConfidence, skinConfidence, strength);
+  finalY = protectMaterialTone(srcY, finalY, srcHsv, greenConfidence, skinConfidence, strength, liftIntent);
   if (greenConfidence > 0.001 && finalY > srcY) {
-    finalY = Math.min(finalY, srcY + 0.045 + 0.030 * (1 - srcY));
+    finalY = Math.min(finalY, srcY + 0.045 + 0.030 * (1 - srcY) + liftIntent * 0.074);
   }
   [tr, tg, tb] = fitRgbToLuma(tr, tg, tb, finalY);
 
@@ -1863,6 +1890,102 @@ function clearCanvas(canvas) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
+function outputParamsSignature(output) {
+  return JSON.stringify({
+    params: output?.params || {},
+    maxEdge: output?.previewOnly ? Number(dom.sizeSelect.value) : output?.maxEdge ?? null,
+  });
+}
+
+function highQualityDisplayNeeded(output) {
+  if (!output?.canvas) return false;
+  if (output.previewOnly && output.sourceFile) return true;
+  if (!output.baseCanvas) return false;
+  return output.baseCanvas.width > output.canvas.width || output.baseCanvas.height > output.canvas.height;
+}
+
+function hasCurrentHighQualityDisplay(output) {
+  return Boolean(output?.highQualityCanvas && output.highQualitySignature === outputParamsSignature(output));
+}
+
+function invalidateHighQualityDisplay(output) {
+  if (!output) return;
+  output.highQualityCanvas = null;
+  output.highQualitySourceCanvas = null;
+  output.highQualityPromise = null;
+  output.highQualitySignature = "";
+}
+
+function drawOutputCanvases(output) {
+  const useHighQuality = hasCurrentHighQualityDisplay(output);
+  const resultSource = useHighQuality ? output.highQualityCanvas : output.canvas;
+  const beforeSource = useHighQuality
+    ? output.highQualitySourceCanvas || output.sourceCanvas || output.sourcePreviewCanvas || resultSource
+    : output.sourcePreviewCanvas || output.sourceCanvas || resultSource;
+
+  const beforeCtx = getSrgb2dContext(dom.beforeCanvas);
+  dom.beforeCanvas.width = beforeSource.width;
+  dom.beforeCanvas.height = beforeSource.height;
+  beforeCtx.drawImage(beforeSource, 0, 0);
+
+  const resultCtx = getSrgb2dContext(dom.resultCanvas);
+  dom.resultCanvas.width = resultSource.width;
+  dom.resultCanvas.height = resultSource.height;
+  resultCtx.drawImage(resultSource, 0, 0);
+}
+
+async function ensureHighQualityDisplay(output) {
+  if (!highQualityDisplayNeeded(output)) return null;
+  const signature = outputParamsSignature(output);
+  if (hasCurrentHighQualityDisplay(output)) return output.highQualityCanvas;
+  if (output.highQualityPromise && output.highQualitySignature === signature) return output.highQualityPromise;
+
+  output.highQualitySignature = signature;
+  output.highQualityPromise = (async () => {
+    const displayName = output.name || "当前结果";
+    let sourceCanvas = output.sourceCanvas;
+    let baseCanvas = output.baseCanvas;
+    if (output.previewOnly && output.sourceFile) {
+      const loaded = await loadImageToImageData(output.sourceFile, Number(dom.sizeSelect.value));
+      sourceCanvas = loaded.canvas;
+      baseCanvas = loaded.canvas;
+    }
+    if (!baseCanvas) return null;
+    const baseImageData = canvasToImageData(baseCanvas);
+    const canvas = await renderManualAdjustmentsToCanvas(
+      baseImageData,
+      output.params || defaultParams(),
+      null,
+      `正在准备高清结果预览：${displayName}`,
+      76,
+      98
+    );
+    if (outputParamsSignature(output) !== signature) return null;
+    output.highQualityCanvas = canvas;
+    output.highQualitySourceCanvas = sourceCanvas || output.sourceCanvas || output.sourcePreviewCanvas || canvas;
+    return canvas;
+  })().finally(() => {
+    if (output.highQualitySignature === signature) output.highQualityPromise = null;
+  });
+  return output.highQualityPromise;
+}
+
+function scheduleHighQualityActiveOutput() {
+  const output = state.activeOutput;
+  const index = state.activeOutputIndex;
+  if (!highQualityDisplayNeeded(output) || hasCurrentHighQualityDisplay(output)) return;
+  ensureHighQualityDisplay(output).then((canvas) => {
+    if (!canvas || state.activeOutput !== output || state.activeOutputIndex !== index) return;
+    drawOutputCanvases(output);
+    applyPreviewViewTransform();
+    setComparePosition(state.comparePosition);
+    setStatus(`高清结果预览已就绪：${output.name}`, 100);
+  }).catch((error) => {
+    console.error(error);
+    if (state.activeOutput === output) setStatus(`高清结果预览失败：${error.message}`, 0);
+  });
+}
+
 function compareLocalPosition() {
   const rect = dom.compareStage.getBoundingClientRect();
   if (rect.width <= 0) return state.comparePosition;
@@ -1945,6 +2068,7 @@ function zoomPreviewView(deltaY, clientX, clientY, targetEl) {
     state.previewView.y = ry - (ry - state.previewView.y) * ratio;
   }
   applyPreviewViewTransform();
+  if (state.previewView.scale > 1.0001) scheduleHighQualityActiveOutput();
 }
 
 function beginPreviewPan(event) {
@@ -2179,18 +2303,10 @@ function selectOutput(index, syncTarget = true) {
   state.activeOutput = output;
   state.activeOutputIndex = index;
 
-  const sourceCanvas = output.sourcePreviewCanvas || output.sourceCanvas || output.canvas;
-  const beforeCtx = getSrgb2dContext(dom.beforeCanvas);
-  dom.beforeCanvas.width = sourceCanvas.width;
-  dom.beforeCanvas.height = sourceCanvas.height;
-  beforeCtx.drawImage(sourceCanvas, 0, 0);
-
-  const resultCtx = getSrgb2dContext(dom.resultCanvas);
-  dom.resultCanvas.width = output.canvas.width;
-  dom.resultCanvas.height = output.canvas.height;
-  resultCtx.drawImage(output.canvas, 0, 0);
+  drawOutputCanvases(output);
   dom.resultCanvas.closest(".preview-frame").classList.add("has-media");
   applyPreviewViewTransform();
+  if (state.previewView.scale > 1.0001) scheduleHighQualityActiveOutput();
   setComparePosition(state.comparePosition);
   dom.downloadBtn.disabled = false;
   updateActiveThumbs(dom.resultThumbs, index);
@@ -2277,6 +2393,7 @@ async function processBaseTarget(file, index, total, imageParams, options = {}) 
     previewBaseImageData,
     sourceCanvas: loaded.canvas,
     sourcePreviewCanvas,
+    sourceFile: file,
     blob: thumbBlob,
     url,
     name: outputName(file.name, dom.formatSelect.value),
@@ -2358,6 +2475,7 @@ async function processTarget(file, refStats, index, total, imageParams) {
     previewBaseImageData,
     sourceCanvas: loaded.canvas,
     sourcePreviewCanvas,
+    sourceFile: file,
     blob: thumbBlob,
     url,
     name,
@@ -2604,6 +2722,7 @@ async function refreshManualPreview() {
     if (revision !== state.previewRevision || index !== state.activeTargetIndex || state.outputs[index] !== output) return;
     output.canvas = canvas;
     output.params = deepClone(params);
+    invalidateHighQualityDisplay(output);
     selectOutput(index, false);
     setStatus(`实时预览已更新：${state.targets[index]?.name || output.name}`, 100);
   } catch (error) {
