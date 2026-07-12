@@ -691,7 +691,8 @@ input[type="range"] {
   object-fit: contain;
   background: var(--media-bg);
   transform-origin: 50% 50%;
-  will-change: transform;
+  image-rendering: auto;
+  will-change: left, top, width, height;
 }
 
 .preview-frame canvas {

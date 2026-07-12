@@ -1870,13 +1870,45 @@ function compareLocalPosition() {
   return clamp(local, 0, 100);
 }
 
+function resetPreviewElementBox(el) {
+  if (!el) return;
+  el.style.left = "";
+  el.style.top = "";
+  el.style.right = "";
+  el.style.bottom = "";
+  el.style.width = "";
+  el.style.height = "";
+  el.style.transform = "";
+}
+
+function positionPreviewElementBox(el, container) {
+  if (!el || !container) return;
+  const { scale, x, y } = state.previewView;
+  if (scale <= 1.0001) {
+    resetPreviewElementBox(el);
+    return;
+  }
+
+  const rect = container.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+
+  const width = rect.width * scale;
+  const height = rect.height * scale;
+  el.style.left = `${(rect.width - width) / 2 + x}px`;
+  el.style.top = `${(rect.height - height) / 2 + y}px`;
+  el.style.right = "auto";
+  el.style.bottom = "auto";
+  el.style.width = `${width}px`;
+  el.style.height = `${height}px`;
+  el.style.transform = "none";
+}
+
 function applyPreviewViewTransform() {
   const { scale, x, y } = state.previewView;
-  const transform = `translate(${x}px, ${y}px) scale(${scale})`;
-  for (const el of [dom.targetPreview, dom.beforeCanvas, dom.resultCanvas]) {
-    if (!el) continue;
-    el.style.transform = transform;
-  }
+  const targetMedia = dom.targetPreview?.closest(".preview-media");
+  positionPreviewElementBox(dom.targetPreview, targetMedia);
+  positionPreviewElementBox(dom.beforeCanvas, dom.compareStage);
+  positionPreviewElementBox(dom.resultCanvas, dom.compareStage);
   dom.compareStage.style.setProperty("--preview-scale", String(scale));
   dom.compareStage.style.setProperty("--preview-pan-x", `${x}px`);
   dom.compareStage.style.setProperty("--preview-pan-y", `${y}px`);
@@ -2824,6 +2856,7 @@ function bindEvents() {
       event.preventDefault();
     });
   }
+  window.addEventListener("resize", applyPreviewViewTransform);
   if (targetMedia) {
     targetMedia.addEventListener("pointerdown", beginPreviewPan);
     targetMedia.addEventListener("pointermove", movePreviewPan);
