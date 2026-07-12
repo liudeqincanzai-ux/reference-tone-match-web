@@ -112,7 +112,6 @@ const USER_LUT_LIMIT = 50;
 const LUT_DB_NAME = "reference-tone-match-luts";
 const LUT_DB_VERSION = 1;
 const LUT_STORE_NAME = "luts";
-const LUT_ACTIVE_STORAGE_KEY = "reference-tone-match-active-luts";
 const RAW_EXTENSIONS = new Set(["arw", "orf", "rw2", "raf", "cr2", "cr3", "nef", "dng", "srw", "pef", "3fr", "rwl"]);
 const DECODE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp", "avif", "gif", "bmp", "heic", "heif"]);
 const HSL_CHANNELS = ["red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"];
@@ -220,6 +219,7 @@ function defaultParams() {
       saturation: 0,
     },
     hsl: defaultHsl(),
+    userLutIds: ["", ""],
     userLutAmounts: [100, 100],
   };
 }
@@ -1426,11 +1426,12 @@ function sampleCubeLut(lut, r, g, b) {
 
 function applyUserLutsToSrgb(r, g, b, settings) {
   const amounts = settings.userLutAmounts || [100, 100];
+  const activeLuts = settings.resolvedUserLuts || state.userLuts;
   let sr = clamp01(r);
   let sg = clamp01(g);
   let sb = clamp01(b);
-  for (let layer = 0; layer < state.userLuts.length; layer += 1) {
-    const lut = state.userLuts[layer]?.lut;
+  for (let layer = 0; layer < activeLuts.length; layer += 1) {
+    const lut = activeLuts[layer]?.lut;
     const amount = clamp((amounts[layer] ?? 100) / 100, 0, 1);
     if (!lut || amount <= 0) continue;
     const mapped = sampleCubeLut(lut, sr, sg, sb);
@@ -1439,6 +1440,40 @@ function applyUserLutsToSrgb(r, g, b, settings) {
     sb = mix(sb, mapped[2], amount);
   }
   return [clamp01(sr), clamp01(sg), clamp01(sb)];
+}
+
+function blankUserLut() {
+  return { id: "", name: "", lut: null };
+}
+
+function normalizeUserLutIds(ids) {
+  const values = Array.isArray(ids) ? ids : [];
+  return [0, 1].map((index) => String(values[index] || ""));
+}
+
+function resolveUserLutById(id) {
+  const entry = state.lutLibrary.find((item) => item.id === id);
+  if (!entry) return blankUserLut();
+  if (!entry.parsed) entry.parsed = parseCubeLut(entry.text, entry.name);
+  return { id: entry.id, name: entry.name, lut: entry.parsed };
+}
+
+function resolveUserLutsForIds(ids) {
+  return normalizeUserLutIds(ids).map((id) => (id ? resolveUserLutById(id) : blankUserLut()));
+}
+
+function setActiveUserLutsFromIds(ids) {
+  state.userLuts = resolveUserLutsForIds(ids);
+  renderLutLibrary();
+}
+
+function settingsWithResolvedUserLuts(settings) {
+  const ids = Array.isArray(settings?.userLutIds) ? settings.userLutIds : state.userLuts.map((item) => item.id || "");
+  return {
+    ...settings,
+    userLutIds: normalizeUserLutIds(ids),
+    resolvedUserLuts: resolveUserLutsForIds(ids),
+  };
 }
 
 function openLutDb() {
@@ -1488,23 +1523,6 @@ function getAllStoredLuts() {
   }));
 }
 
-function storedActiveLutIds() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(LUT_ACTIVE_STORAGE_KEY) || "[]");
-    return Array.isArray(parsed) ? parsed.slice(0, 2).map((id) => String(id || "")) : ["", ""];
-  } catch {
-    return ["", ""];
-  }
-}
-
-function persistActiveLutIds() {
-  try {
-    localStorage.setItem(LUT_ACTIVE_STORAGE_KEY, JSON.stringify(state.userLuts.map((item) => item.id || "")));
-  } catch {
-    // Ignore private browsing storage failures.
-  }
-}
-
 function renderLutLibrary() {
   const sorted = state.lutLibrary.slice().sort((a, b) => b.createdAt - a.createdAt);
   if (dom.lutLibraryCount) dom.lutLibraryCount.textContent = `${sorted.length}/${USER_LUT_LIMIT}`;
@@ -1536,24 +1554,10 @@ async function loadLutLibrary() {
 }
 
 async function selectUserLut(layer, id, options = {}) {
-  const entry = state.lutLibrary.find((item) => item.id === id);
-  if (!entry) {
-    state.userLuts[layer] = { id: "", name: "", lut: null };
-  } else {
-    if (!entry.parsed) entry.parsed = parseCubeLut(entry.text, entry.name);
-    state.userLuts[layer] = { id: entry.id, name: entry.name, lut: entry.parsed };
-  }
-  persistActiveLutIds();
+  state.userLuts[layer] = id ? resolveUserLutById(id) : blankUserLut();
   renderLutLibrary();
   saveCurrentParams();
   if (options.refresh !== false) scheduleSmartPreviewUpdate();
-}
-
-async function restoreActiveLuts() {
-  const ids = storedActiveLutIds();
-  for (let layer = 0; layer < dom.lutSelects.length; layer += 1) {
-    if (ids[layer]) await selectUserLut(layer, ids[layer], { refresh: false });
-  }
 }
 
 async function saveLutEntry(file, text, parsed) {
@@ -1576,17 +1580,33 @@ async function saveLutEntry(file, text, parsed) {
   return entry;
 }
 
+function removeUserLutIdFromParams(params, id) {
+  if (!params) return;
+  params.userLutIds = normalizeUserLutIds(params.userLutIds).map((lutId) => (lutId === id ? "" : lutId));
+}
+
+function removeUserLutIdEverywhere(id) {
+  for (const params of state.targetParams) removeUserLutIdFromParams(params, id);
+  if (state.copiedParams) removeUserLutIdFromParams(state.copiedParams, id);
+  for (const output of state.outputs) {
+    if (!output) continue;
+    removeUserLutIdFromParams(output.params, id);
+    invalidateHighQualityDisplay(output);
+  }
+}
+
 async function deleteLutEntry(id) {
   if (!id) return;
   await runLutStore("readwrite", (store) => store.delete(id));
   state.lutLibrary = state.lutLibrary.filter((entry) => entry.id !== id);
   for (let layer = 0; layer < state.userLuts.length; layer += 1) {
     if (state.userLuts[layer].id === id) {
-      state.userLuts[layer] = { id: "", name: "", lut: null };
+      state.userLuts[layer] = blankUserLut();
     }
   }
-  persistActiveLutIds();
+  removeUserLutIdEverywhere(id);
   renderLutLibrary();
+  saveCurrentParams();
   scheduleSmartPreviewUpdate();
 }
 
@@ -1788,6 +1808,7 @@ function readParamsFromControls() {
     const axis = input.dataset.axis;
     params.hsl[channel][axis] = Number(input.value);
   }
+  params.userLutIds = state.userLuts.map((item) => item.id || "");
   params.userLutAmounts = dom.lutAmountRanges.map((input) => Number(input?.value ?? 100));
   return params;
 }
@@ -1815,6 +1836,7 @@ function applyParamsToControls(params) {
   for (let layer = 0; layer < dom.lutAmountRanges.length; layer += 1) {
     if (dom.lutAmountRanges[layer]) dom.lutAmountRanges[layer].value = next.userLutAmounts?.[layer] ?? 100;
   }
+  setActiveUserLutsFromIds(next.userLutIds || []);
   updateAdjustmentLabels();
   updateHslLabels();
   updateLutLabels();
@@ -2331,6 +2353,7 @@ function replaceOutput(index, output, select = true) {
 }
 
 async function renderManualAdjustmentsToCanvas(baseImageData, settings, targetCanvas = null, statusText = null, progressStart = null, progressEnd = null) {
+  const renderSettings = settingsWithResolvedUserLuts(settings || defaultParams());
   const canvas = targetCanvas || document.createElement("canvas");
   canvas.width = baseImageData.width;
   canvas.height = baseImageData.height;
@@ -2346,9 +2369,9 @@ async function renderManualAdjustmentsToCanvas(baseImageData, settings, targetCa
       baseImageData.data[i] / 255,
       baseImageData.data[i + 1] / 255,
       baseImageData.data[i + 2] / 255,
-      settings
+      renderSettings
     );
-    const withLut = applyUserLutsToSrgb(adjusted[0], adjusted[1], adjusted[2], settings);
+    const withLut = applyUserLutsToSrgb(adjusted[0], adjusted[1], adjusted[2], renderSettings);
     out.data[i] = Math.round(withLut[0] * 255);
     out.data[i + 1] = Math.round(withLut[1] * 255);
     out.data[i + 2] = Math.round(withLut[2] * 255);
@@ -2817,9 +2840,8 @@ async function importUserLut(layer) {
 }
 
 function clearUserLut(layer) {
-  state.userLuts[layer] = { id: "", name: "", lut: null };
+  state.userLuts[layer] = blankUserLut();
   if (dom.lutInputs[layer]) dom.lutInputs[layer].value = "";
-  persistActiveLutIds();
   renderLutLibrary();
   saveCurrentParams();
   scheduleSmartPreviewUpdate();
@@ -2857,7 +2879,9 @@ function bindEvents() {
   dom.targetsInput.addEventListener("change", () => {
     state.targets = Array.from(dom.targetsInput.files || []).filter((file) => canBrowserDecode(file) || isRawFile(file));
     state.activeTargetIndex = 0;
-    state.targetParams = state.targets.map(() => readParamsFromControls());
+    const params = readParamsFromControls();
+    params.userLutIds = ["", ""];
+    state.targetParams = state.targets.map(() => deepClone(params));
     clearTimeout(state.liveTimer);
     clearOutputs();
     refreshFileLists();
@@ -2865,7 +2889,9 @@ function bindEvents() {
   dom.folderInput.addEventListener("change", () => {
     state.targets = Array.from(dom.folderInput.files || []).filter((file) => canBrowserDecode(file) || isRawFile(file));
     state.activeTargetIndex = 0;
-    state.targetParams = state.targets.map(() => readParamsFromControls());
+    const params = readParamsFromControls();
+    params.userLutIds = ["", ""];
+    state.targetParams = state.targets.map(() => deepClone(params));
     clearTimeout(state.liveTimer);
     clearOutputs();
     refreshFileLists();
@@ -3041,7 +3067,6 @@ async function initializeApp() {
   bindEvents();
   refreshFileLists();
   await loadLutLibrary();
-  await restoreActiveLuts();
 }
 
 initializeApp().catch((error) => {
